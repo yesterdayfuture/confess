@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Confess pre-push hook. Blocks push until AI-assisted commits are confessed."""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+CONFESSIONS_FILE = "CONFESSIONS.md"
+SKIP_ENV = "CONFESS_SKIP"
+
+QUESTIONS = [
+    ("what", "What does this code do? (your own words, not a paste of comments)"),
+    ("risk", "If this breaks in production tomorrow, what is the most likely cause?"),
+    ("verify", "How would you verify it's correct in under 5 minutes?"),
+]
+
+# Case-insensitive substrings matched against commit messages.
+AI_MARKERS = (
+    "co-authored-by: claude",
+    "co-authored-by: copilot",
+    "co-authored-by: cursor",
+    "co-authored-by: codex",
+    "co-authored-by: aider",
+    "generated-by: claude",
+    "generated-by: copilot",
+    "generated-with: claude",
+    "🤖 generated with",
+)
+
+SHA_ABBREV_LEN = 12
+
+
+def git(*args: str) -> str:
+    # core.quotepath=false → UTF-8 paths (e.g. 未命名.txt) instead of
+    # C-quoted octal escapes like "\346\234\252\345\221\275\345\220\215.txt".
+    result = subprocess.run(
+        ["git", "-c", "core.quotepath=false", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.stdout.strip()
+
+
+def decode_git_path(path: str) -> str:
+    """Decode a git path that may still be C-quoted with octal escapes."""
+    path = path.strip()
+    if len(path) < 2 or path[0] != '"' or path[-1] != '"':
+        return path
+    raw = path[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 3 < len(raw) and raw[i + 1] in "01234567":
+            out.append(int(raw[i + 1 : i + 4], 8))
+            i += 4
+        elif raw[i] == "\\" and i + 1 < len(raw):
+            esc = raw[i + 1]
+            out.extend(
+                { "n": b"\n", "t": b"\t", '"': b'"', "\\": b"\\" }.get(
+                    esc, raw[i : i + 2].encode("latin-1")
+                )
+            )
+            i += 2
+        else:
+            out.append(ord(raw[i]))
+            i += 1
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return path
+
+
+def is_ai_assisted(sha: str) -> bool:
+    msg = git("log", "-1", "--format=%B", sha).lower()
+    return any(marker in msg for marker in AI_MARKERS)
+
+
+def changed_files(local_sha: str, remote_sha: str) -> list:
+    """Files touched by this push, excluding deletions."""
+    if remote_sha and set(remote_sha) != {"0"}:
+        diff = git("diff", "--name-only", "--diff-filter=ACMR",
+                   f"{remote_sha}..{local_sha}")
+    else:
+        # New branch: diff from merge-base with origin/HEAD, or first parent.
+        base = git("merge-base", "origin/HEAD", local_sha)
+        if not base:
+            base = git("rev-parse", f"{local_sha}~1") or local_sha
+        diff = git("diff", "--name-only", "--diff-filter=ACMR",
+                   f"{base}..{local_sha}")
+    return [
+        decode_git_path(line)
+        for line in diff.splitlines()
+        if line.strip()
+    ]
+
+
+def already_confessed(shas: list) -> set:
+    """Return the subset of shas already recorded in CONFESSIONS.md."""
+    if not os.path.exists(CONFESSIONS_FILE):
+        return set()
+    content = open(CONFESSIONS_FILE, encoding="utf-8").read()
+    found = set()
+    for sha in shas:
+        if re.search(rf"—\s*`{re.escape(sha[:SHA_ABBREV_LEN])}", content):
+            found.add(sha)
+    return found
+
+
+def _pick_editor() -> str:
+    for env in ("EDITOR", "VISUAL"):
+        editor = os.environ.get(env)
+        if editor:
+            return editor
+    for candidate in ("nano", "vim", "vi"):
+        if shutil_which(candidate):
+            return candidate
+    return ""
+
+
+def shutil_which(name: str) -> str:
+    return shutil_which_impl(name)
+
+
+def shutil_which_impl(name: str) -> str:
+    import shutil
+    return shutil.which(name) or ""
+
+
+def prompt_multiline(question: str) -> str:
+    """Collect a multi-line answer via $EDITOR, or stdin if that's a TTY."""
+    editor = _pick_editor()
+    if editor:
+        with tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".md", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(f"# {question}\n\n")
+            f.write("<!-- Write your answer below this line, then save and exit. -->\n\n")
+            tmp = f.name
+        try:
+            rc = subprocess.run(
+                editor.split() + [tmp], check=False
+            ).returncode
+            if rc != 0:
+                return ""
+            content = open(tmp, encoding="utf-8").read()
+        finally:
+            os.unlink(tmp)
+        content = re.sub(
+            r"^# .*\n\n<!--.*?-->\n\n", "", content, count=1, flags=re.DOTALL
+        )
+        return content.strip()
+
+    # No editor available. Only safe fallback is an interactive terminal.
+    if not sys.stdin.isatty():
+        print(f"\n✗ No $EDITOR found and stdin is not a terminal.", file=sys.stderr)
+        print(f"  Set EDITOR (e.g. export EDITOR=vim) or use CONFESS_SKIP=1 to bypass.",
+              file=sys.stderr)
+        return ""
+
+    print(f"\n{question}")
+    print("(type your answer, end with an empty line)")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line and lines:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def append_confession(sha: str, files: list, answers: dict = None,
+                      skipped: bool = False, skip_reason: str = "") -> None:
+    entry = [f"## {datetime.now(timezone.utc).isoformat()} — "
+             f"`{sha[:SHA_ABBREV_LEN]}`"]
+    if skipped:
+        entry.append(f"**SKIPPED**: {skip_reason or 'no reason given'}")
+    else:
+        entry.append(f"**Files**: {', '.join(files) if files else '(none)'}")
+        for key, question in QUESTIONS:
+            entry.append(f"\n### {question}")
+            entry.append(answers.get(key, "_(empty)_"))
+    entry.append("")
+
+    prefix = ""
+    if os.path.exists(CONFESSIONS_FILE):
+        existing = open(CONFESSIONS_FILE, encoding="utf-8").read()
+        if existing and not existing.endswith("\n"):
+            prefix = "\n"
+    with open(CONFESSIONS_FILE, "a", encoding="utf-8") as f:
+        f.write(prefix + "\n".join(entry) + "\n")
+
+
+def main() -> int:
+    stdin_data = sys.stdin.read()
+    pending = []  # (local_sha, remote_sha)
+    for line in stdin_data.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        _local_ref, local_sha, _remote_ref, remote_sha = parts[:4]
+        if set(local_sha) == {"0"}:
+            continue  # deletion — nothing to confess
+        pending.append((local_sha, remote_sha))
+
+    if not pending:
+        return 0
+
+    ai_commits = [(s, r) for s, r in pending if is_ai_assisted(s)]
+    if not ai_commits:
+        return 0
+
+    # A commit already recorded in CONFESSIONS.md is allowed through.
+    confessed = already_confessed([s for s, _ in ai_commits])
+    unconfessed = [(s, r) for s, r in ai_commits if s not in confessed]
+    if not unconfessed:
+        return 0
+
+    files = set()
+    for s, r in unconfessed:
+        files.update(changed_files(s, r))
+
+    print("\n" + "=" * 62)
+    print("  CONFESS  —  AI-assisted code detected")
+    print("=" * 62)
+    print(f"  Commits: {', '.join(s[:8] for s, _ in unconfessed)}")
+    print(f"  Files:   {', '.join(sorted(files)) or '(no file diff detected)'}")
+    print("  Answer three questions before this push proceeds.")
+    print("  Set CONFESS_SKIP=1 to skip (skips are recorded).\n")
+
+    # --- Skip path: record and let the push through ---
+    if os.environ.get(SKIP_ENV):
+        reason = os.environ.get(f"{SKIP_ENV}_REASON", "")
+        for s, _ in unconfessed:
+            append_confession(s, sorted(files), skipped=True, skip_reason=reason)
+        git("add", CONFESSIONS_FILE)
+        print(f"⏭  Skipped confession for {len(unconfessed)} commit(s).")
+        print(f"   Record written to {CONFESSIONS_FILE} (staged). Push will proceed.\n")
+        return 0
+
+    # --- Normal path: collect answers, block until committed ---
+    answers = {}
+    for key, question in QUESTIONS:
+        answer = prompt_multiline(question)
+        if not answer:
+            print(f"\n✗ Missing answer for: {question}")
+            print("  Push blocked. Provide an answer or set CONFESS_SKIP=1.\n")
+            return 1
+        answers[key] = answer
+
+    for s, _ in unconfessed:
+        append_confession(s, sorted(files), answers=answers)
+
+    git("add", CONFESSIONS_FILE)
+    print(f"\n✓ Confession recorded in {CONFESSIONS_FILE} (staged).")
+    print("  Commit it, then push again:\n")
+    print(f'    git commit -m "confess: explain {unconfessed[0][0][:8]}"')
+    print("    git push\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
