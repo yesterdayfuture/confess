@@ -78,6 +78,26 @@ def is_ai_assisted(sha: str) -> bool:
     return any(marker in msg for marker in AI_MARKERS)
 
 
+def commits_in_push(local_sha: str, remote_sha: str) -> list:
+    """All commit SHAs about to be pushed for this ref (oldest first).
+
+    Git's pre-push stdin only gives the tip SHA per ref; AI markers may sit on
+    any commit in remote..local, so we must enumerate the full range.
+    """
+    if remote_sha and set(remote_sha) != {"0"}:
+        out = git("rev-list", "--reverse", f"{remote_sha}..{local_sha}")
+    else:
+        # New branch: commits not yet on any remote, falling back to merge-base.
+        out = git("rev-list", "--reverse", local_sha, "--not", "--remotes")
+        if not out:
+            base = git("merge-base", "origin/HEAD", local_sha)
+            if base:
+                out = git("rev-list", "--reverse", f"{base}..{local_sha}")
+            else:
+                out = git("rev-list", "--reverse", local_sha)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def changed_files(local_sha: str, remote_sha: str) -> list:
     """Files touched by this push, excluding deletions."""
     if remote_sha and set(remote_sha) != {"0"}:
@@ -211,24 +231,39 @@ def main() -> int:
     if not pending:
         return 0
 
-    ai_commits = [(s, r) for s, r in pending if is_ai_assisted(s)]
+    # Tip SHA alone is not enough: AI markers may be on any commit in the range.
+    ai_commits = []  # (sha, tip_sha, remote_sha) — tip used for file diffs
+    seen = set()
+    for tip_sha, remote_sha in pending:
+        for sha in commits_in_push(tip_sha, remote_sha):
+            if sha in seen:
+                continue
+            seen.add(sha)
+            if is_ai_assisted(sha):
+                ai_commits.append((sha, tip_sha, remote_sha))
+
     if not ai_commits:
         return 0
 
     # A commit already recorded in CONFESSIONS.md is allowed through.
-    confessed = already_confessed([s for s, _ in ai_commits])
-    unconfessed = [(s, r) for s, r in ai_commits if s not in confessed]
+    confessed = already_confessed([s for s, _, _ in ai_commits])
+    unconfessed = [(s, tip, r) for s, tip, r in ai_commits if s not in confessed]
     if not unconfessed:
         return 0
 
     files = set()
-    for s, r in unconfessed:
-        files.update(changed_files(s, r))
+    ranges_seen = set()
+    for _, tip, r in unconfessed:
+        key = (tip, r)
+        if key in ranges_seen:
+            continue
+        ranges_seen.add(key)
+        files.update(changed_files(tip, r))
 
     print("\n" + "=" * 62)
     print("  CONFESS  —  AI-assisted code detected")
     print("=" * 62)
-    print(f"  Commits: {', '.join(s[:8] for s, _ in unconfessed)}")
+    print(f"  Commits: {', '.join(s[:8] for s, _, _ in unconfessed)}")
     print(f"  Files:   {', '.join(sorted(files)) or '(no file diff detected)'}")
     print("  Answer three questions before this push proceeds.")
     print("  Set CONFESS_SKIP=1 to skip (skips are recorded).\n")
@@ -236,7 +271,7 @@ def main() -> int:
     # --- Skip path: record and let the push through ---
     if os.environ.get(SKIP_ENV):
         reason = os.environ.get(f"{SKIP_ENV}_REASON", "")
-        for s, _ in unconfessed:
+        for s, _, _ in unconfessed:
             append_confession(s, sorted(files), skipped=True, skip_reason=reason)
         git("add", CONFESSIONS_FILE)
         print(f"⏭  Skipped confession for {len(unconfessed)} commit(s).")
@@ -253,7 +288,7 @@ def main() -> int:
             return 1
         answers[key] = answer
 
-    for s, _ in unconfessed:
+    for s, _, _ in unconfessed:
         append_confession(s, sorted(files), answers=answers)
 
     git("add", CONFESSIONS_FILE)

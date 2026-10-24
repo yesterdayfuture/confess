@@ -176,3 +176,73 @@ def test_skip_env_allows_push_simulation(hook, git_repo, monkeypatch):
     assert rc == 0
     assert (git_repo / "CONFESSIONS.md").exists()
     assert "SKIPPED" in (git_repo / "CONFESSIONS.md").read_text(encoding="utf-8")
+
+
+def _rev_parse(repo, ref="HEAD"):
+    return subprocess.check_output(
+        ["git", "rev-parse", ref], cwd=repo, text=True
+    ).strip()
+
+
+def test_commits_in_push_lists_full_range(hook, git_repo, monkeypatch):
+    monkeypatch.chdir(git_repo)
+    base = _rev_parse(git_repo)
+    for msg in ("one", "two", "three"):
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", msg],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+    tip = _rev_parse(git_repo)
+    shas = hook.commits_in_push(tip, base)
+    assert len(shas) == 3
+    assert tip == shas[-1]
+    assert base not in shas
+
+
+def test_middle_ai_commit_is_detected(hook, git_repo, monkeypatch):
+    """Only a middle commit has AI markers; tip is human — still gate."""
+    monkeypatch.chdir(git_repo)
+    remote = _rev_parse(git_repo)
+
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "plain first"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "ai middle\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+        ],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    ai_sha = _rev_parse(git_repo)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "plain tip"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+    tip = _rev_parse(git_repo)
+
+    assert hook.is_ai_assisted(tip) is False
+    assert hook.is_ai_assisted(ai_sha) is True
+
+    stdin = f"refs/heads/main {tip} refs/heads/main {remote}\n"
+    monkeypatch.setenv("CONFESS_SKIP", "1")
+    monkeypatch.setenv("CONFESS_SKIP_REASON", "middle-ai")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    rc = hook.main()
+    assert rc == 0
+    text = (git_repo / "CONFESSIONS.md").read_text(encoding="utf-8")
+    assert f"`{ai_sha[:12]}`" in text
+    assert "SKIPPED" in text
+    assert f"`{tip[:12]}`" not in text
